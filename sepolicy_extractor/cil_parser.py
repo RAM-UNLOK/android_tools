@@ -1,541 +1,448 @@
 """
 cil_parser.py — Part 3 of the pipeline.
 
-Parses raw CIL lines into structured per-domain .te content.
+Parses CIL into a STRUCTURED policy model (no string munging, no regex on
+rules). The writer renders it to .te.
 
-CIL format recap:
-    Every statement is a single S-expression on one line:
-        (keyword arg1 arg2 ...)
+Parser: a real S-expression reader (handles ';' comments, quoted strings and
+statements that span several lines). The old one required each statement on
+one line and silently dropped anything with a trailing comment.
 
-CIL → .te conversion table:
-    (type X)                              → type X;
-    (typeattribute X)                     → attribute X;
-    (typealias X)                         → (collected, paired with typealiasactual)
-    (typealiasactual ALIAS REAL)          → typealias REAL ALIAS;
-    (typeattributeset ATTR (T1 T2 ...))   → typeattribute T1 ATTR;  (one per member, into each member's .te)
-    (allow S T (CLASS (PERM...)))         → allow S T:CLASS { PERM... };
-    (dontaudit S T (CLASS (PERM...)))     → dontaudit S T:CLASS { PERM... };
-    (neverallow S T (CLASS (PERM...)))    → neverallow S T:CLASS { PERM... };
-    (typetransition S E process D)        → type_transition S E:process D;
-    (typetransition S E CLASS D NAME)     → type_transition S E:CLASS D:NAME;  (file name trans)
-    (allowx S T (ioctl CLASS (RANGE...))) → allowxperm S T:CLASS ioctl { RANGE... };
-    (expandtypeattribute (X...) true)     → expandtypeattribute X true;
-    (genfscon FS PATH (u o TYPE s))       → genfscon FS PATH u:o:TYPE:s0
-                                            (collected into genfs_contexts, not .te)
-
-Output structure returned by parse_all_cil():
+Per-partition result
+--------------------
 {
-    "vendor": {
-        "domains": {
-            "hal_audio_default": {
-                "type_decl":      ["type hal_audio_default;"],
-                "attributes":     ["typeattribute hal_audio_default domain;", ...],
-                "rules":          ["allow hal_audio_default ...", ...],
-            },
-            "init": {        ← _202404 suffix stripped
-                ...
-            },
-            ...
-        },
-        "global_attributes": {
-            # typeattribute declarations with no member assignments
-            "domain": ["attribute domain;"],
-            ...
-        },
-        "genfs_contexts": [
-            "genfscon debugfs /mali0/ctx/kcpu_queues u:object_r:debugfs_mali_ctx_kcpu_queues:s0",
-            ...
-        ],
-    },
-    "odm": { ... },
-    ...
+  "types":        set(name)                       # (type X)
+  "attributes":   set(name)                       # (typeattribute X)
+  "attrsets":     [(attr, expr)]                  # raw typeattributeset, resolved later
+  "type_attrs":   {type: set(attr)}               # filled by parse_all_cil()
+  "aliases":      {real: set(alias)}
+  "av":           {(action,src,tgt,cls): set(perms)}
+  "avx":          {(action,src,tgt,cls,xtype): set(xperms)}
+  "tt":           {(src,tgt,cls,name|None): new_type}   # type_transition
+  "other_tt":     [(kind,src,tgt,cls,new)]        # type_change / type_member
+  "raw_rules":    {subject: [te_line]}            # ~perm / * forms we can't merge
+  "permissive":   set(type)
+  "expand":       {name: "true"/"false"}
+  "typebounds":   set((parent, child))
+  "genfs_contexts": [line]
+  "parse_errors": [str]
+  "unhandled":    Counter(keyword)
 }
 """
 
 import re
+from collections import Counter, defaultdict
 from config import DEFAULT_PLAT_VERSION
 
+_TOK = re.compile(r'"(?:[^"\\]|\\.)*"|;[^\n]*|\(|\)|[^\s()";]+')
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+SKIP_ATTR = {"cil_gen_require"}          # checkpolicy -C bookkeeping, not real policy
+SET_OPS = {"and", "or", "not", "xor", "all"}
+AV_ACTIONS = ("allow", "dontaudit", "auditallow", "neverallow")
+AVX_ACTIONS = {"allowx": "allowxperm", "dontauditx": "dontauditxperm",
+               "auditallowx": "auditallowxperm", "neverallowx": "neverallowxperm"}
+GENFS_FTYPE = {"file": "--", "dir": "-d", "char": "-c", "block": "-b",
+               "socket": "-s", "pipe": "-p", "symlink": "-l"}
 
-def _strip_version(name: str, version: str) -> str:
-    """
-    Remove the platform version suffix from a type name.
-    e.g. init_202404 → init,  servicemanager_202404 → servicemanager
-    Leaves vendor-native names unchanged (hal_audio_default → hal_audio_default).
-    """
-    suffix = f"_{version}"
-    if name.endswith(suffix):
-        return name[: -len(suffix)]
-    return name
-
-
-def _sv(name: str, version: str) -> str:
-    """Shorthand for _strip_version."""
-    return _strip_version(name, version)
-
-
-def _parse_perm_list(token: str) -> str:
-    """
-    Convert a CIL perm token to .te format.
-    Single perm:  read         → read
-    Multi perm:   (read write) → { read write }
-    """
-    token = token.strip()
-    if token.startswith("(") and token.endswith(")"):
-        perms = token[1:-1].split()
-        if len(perms) == 1:
-            return perms[0]
-        return "{ " + " ".join(perms) + " }"
-    return token
+# keywords that carry no .te meaning for this tool (don't nag about them)
+HARMLESS = {"roletype", "role", "roleattribute", "roleattributeset", "user", "userrole",
+            "userlevel", "userrange", "sensitivity", "sensitivityorder", "sensitivitycategory",
+            "category", "categoryorder", "categoryalias", "categoryaliasactual", "level",
+            "levelrange", "sid", "sidorder", "sidcontext", "class", "classorder",
+            "classcommon", "common", "classpermission", "classpermissionset", "classmap",
+            "classmapping", "mls", "handleunknown", "policycap", "defaultuser", "defaultrole",
+            "defaulttype", "defaultrange", "block", "blockinherit", "blockabstract", "in",
+            "optional", "filecon", "fsuse", "netifcon", "nodecon", "portcon", "pirqcon",
+            "iomemcon", "ioportcon", "pcidevicecon", "devicetreecon", "ibpkeycon",
+            "ibendportcon", "selinuxuser", "selinuxuserdefault", "typeattribute_dummy",
+            "mlsconstrain", "mlsvalidatetrans", "constrain", "validatetrans", "permissionx",
+            "rangetransition", "roletransition", "roleallow", "roletype", "typepermissive_dummy"}
 
 
-def _parse_genfscon(parts: list, version: str) -> str:
-    """
-    Convert a genfscon CIL statement into text genfs_contexts format.
+# --------------------------------------------------------------------------
+# name / version helpers
+# --------------------------------------------------------------------------
 
-    CIL:  (genfscon debugfs "/mali0/ctx" (u object_r some_type ((s0) (s0))))
-    parts after keyword: ['debugfs', '"/mali0/ctx"', '(u', 'object_r', 'some_type', '((s0)', '(s0)))']
+def normalize_version(v: str) -> list:
+    """plat_sepolicy_vers.txt holds '202404' (A15) or '34.0' (A14); the type
+    suffix in the CIL is '_202404' / '_34_0'. Return candidate suffixes."""
+    v = (v or "").strip()
+    cands = []
+    if v:
+        cands.append(v)
+        cands.append(v.replace(".", "_"))
+    return list(dict.fromkeys(cands))
 
-    Output: genfscon debugfs /mali0/ctx u:object_r:some_type:s0
-    """
-    if len(parts) < 3:
+
+def detect_suffix(cil_lines: list, hints: list) -> str:
+    """Pick the suffix actually used in the CIL (hint first, else guess)."""
+    text_sample = "\n".join(cil_lines[:200000])
+    for h in hints:
+        if re.search(rf"\b\w+_{re.escape(h)}\b", text_sample):
+            return h
+    m = Counter(re.findall(r"\(type \w+?_(\d{6}|\d+_\d+)\)", text_sample))
+    if m:
+        return m.most_common(1)[0][0]
+    return hints[0] if hints else DEFAULT_PLAT_VERSION
+
+
+def _strip(name: str, suffix: str) -> str:
+    s = f"_{suffix}"
+    return name[:-len(s)] if suffix and name.endswith(s) else name
+
+
+# --------------------------------------------------------------------------
+# S-expression reader
+# --------------------------------------------------------------------------
+
+def read_sexps(lines: list):
+    """-> (list_of_top_level_nodes, error_count). Nodes are str | list."""
+    stack = [[]]
+    errors = 0
+    for m in _TOK.finditer("\n".join(lines)):
+        t = m.group(0)
+        c = t[0]
+        if c == ";":
+            continue
+        if c == "(":
+            new = []
+            stack[-1].append(new)
+            stack.append(new)
+        elif c == ")":
+            if len(stack) > 1:
+                stack.pop()
+            else:
+                errors += 1
+        else:
+            stack[-1].append(t)
+    if len(stack) > 1:
+        errors += len(stack) - 1
+    return stack[0], errors
+
+
+def _is_names(node) -> bool:
+    return isinstance(node, list) and all(isinstance(x, str) for x in node)
+
+
+# --------------------------------------------------------------------------
+# permission / xperm expressions
+# --------------------------------------------------------------------------
+
+def _perm_expr(node):
+    """-> ('set', set) | ('raw', str) | None"""
+    if isinstance(node, str):
+        return ("set", {node})
+    if not isinstance(node, list):
+        return None
+    if node == ["all"]:
+        return ("raw", "*")
+    if node and node[0] == "not" and len(node) == 2:
+        inner = _perm_expr(node[1])
+        if inner and inner[0] == "set":
+            return ("raw", "~{ " + " ".join(sorted(inner[1])) + " }")
+        return None
+    if _is_names(node) and not (node and node[0] in SET_OPS):
+        return ("set", set(node))
+    return None
+
+
+def _xperm_items(node):
+    """xperm list -> ('set', set(str)) | ('raw', str) | None.  (range a b) -> 'a-b'"""
+    if isinstance(node, str):
+        return ("set", {node})
+    if not isinstance(node, list):
+        return None
+    if node and node[0] == "not" and len(node) == 2:
+        inner = _xperm_items(node[1])
+        if inner and inner[0] == "set":
+            return ("raw", "~{ " + " ".join(sorted(inner[1])) + " }")
+        return None
+    out = set()
+    for it in node:
+        if isinstance(it, str):
+            out.add(it)
+        elif isinstance(it, list) and len(it) == 3 and it[0] == "range":
+            out.add(f"{it[1]}-{it[2]}")
+        elif isinstance(it, list) and len(it) == 1 and isinstance(it[0], str):
+            out.add(it[0])
+        else:
+            return None
+    return ("set", out)
+
+
+# --------------------------------------------------------------------------
+# Partition parser
+# --------------------------------------------------------------------------
+
+def parse_partition_cil(cil_lines: list, suffix: str, partition_name: str) -> dict:
+    nodes, unbalanced = read_sexps(cil_lines)
+    sv = lambda n: _strip(n, suffix)
+
+    R = {
+        "types": set(), "attributes": set(), "attrsets": [], "type_attrs": defaultdict(set),
+        "aliases": defaultdict(set), "av": defaultdict(set), "avx": defaultdict(set),
+        "tt": {}, "other_tt": [], "raw_rules": defaultdict(list), "permissive": set(),
+        "expand": {}, "typebounds": set(), "genfs_contexts": [], "parse_errors": [],
+        "unhandled": Counter(), "orig_names": defaultdict(set),
+    }
+    err = R["parse_errors"].append
+    if unbalanced:
+        err(f"[reader] {unbalanced} unbalanced parenthesis")
+
+    permx = {}          # named permissionx definitions
+    pending_alias = set()
+
+    def name(tok):
+        if not isinstance(tok, str):
+            return None
+        s = sv(tok)
+        if s != tok:
+            R["orig_names"][s].add(tok)
+        return s
+
+    def subjects(tok):
+        """source/target token -> list of names (single or expanded set)."""
+        if isinstance(tok, str):
+            return [name(tok)]
+        if _is_names(tok) and tok and tok[0] not in SET_OPS:
+            return [name(t) for t in tok]
         return None
 
-    fs_type = parts[0]
-    path    = parts[1].strip('"')
+    # first pass: named permissionx
+    for st in nodes:
+        if isinstance(st, list) and len(st) == 3 and st[0] == "permissionx" and isinstance(st[1], str):
+            permx[st[1]] = st[2]
 
-    # Extract the security context — find the type name
-    # The context block looks like: (u object_r TYPE_NAME ((s0) (s0)))
-    # Join remaining parts and extract via regex
-    remainder = " ".join(parts[2:])
-    # Match: (u object_r <type> ...)
-    m = re.search(r'\(\s*u\s+object_r\s+(\S+)', remainder)
-    if not m:
+    for st in nodes:
+        if not isinstance(st, list) or not st or not isinstance(st[0], str):
+            continue
+        kw, a = st[0], st[1:]
+
+        if kw == "type" and len(a) == 1:
+            R["types"].add(name(a[0]))
+
+        elif kw == "typeattribute" and len(a) == 1:
+            n = name(a[0])
+            if n not in SKIP_ATTR:
+                R["attributes"].add(n)
+
+        elif kw == "typeattributeset" and len(a) == 2:
+            n = name(a[0])
+            if n not in SKIP_ATTR:
+                R["attrsets"].append((n, _mapnames(a[1], name)))
+
+        elif kw == "typealias" and len(a) == 1:
+            pending_alias.add(name(a[0]))
+
+        elif kw == "typealiasactual" and len(a) == 2:
+            R["aliases"][name(a[1])].add(name(a[0]))
+
+        elif kw == "typepermissive" and len(a) == 1:
+            R["permissive"].add(name(a[0]))
+
+        elif kw == "typebounds" and len(a) == 2:
+            R["typebounds"].add((name(a[0]), name(a[1])))
+
+        elif kw == "expandtypeattribute" and len(a) == 2:
+            names = a[0] if isinstance(a[0], list) else [a[0]]
+            for t in names:
+                R["expand"][name(t)] = a[1]
+
+        elif kw in AV_ACTIONS:
+            _av(kw, a, R, subjects, permx, err, st)
+
+        elif kw in AVX_ACTIONS:
+            _avx(kw, a, R, subjects, permx, err, st)
+
+        elif kw == "typetransition" and len(a) in (4, 5):
+            s, t, c = name(a[0]), name(a[1]), a[2]
+            rest = a[3:]
+            # CIL order is: [object_name] default_type  (name comes FIRST).
+            fname = next((x for x in rest if isinstance(x, str) and x.startswith('"')), None)
+            new = next((x for x in rest if isinstance(x, str) and not x.startswith('"')), None)
+            if None in (s, t) or not isinstance(c, str) or new is None:
+                err(f"[typetransition] {st}")
+            else:
+                R["tt"][(s, t, c, fname)] = name(new)
+
+        elif kw in ("typechange", "typemember") and len(a) == 4:
+            R["other_tt"].append((kw, name(a[0]), name(a[1]), a[2], name(a[3])))
+
+        elif kw == "genfscon" and len(a) in (3, 4):
+            line = _genfs(a, sv)
+            if line:
+                R["genfs_contexts"].append(line)
+            else:
+                err(f"[genfscon] {st}")
+
+        elif kw not in HARMLESS:
+            R["unhandled"][kw] += 1
+
+    # name collisions caused by suffix stripping
+    for s, origs in R["orig_names"].items():
+        if (s in R["types"] or s in R["attributes"]) and any(o != s for o in origs):
+            pass  # informational only
+    return R
+
+
+def _mapnames(node, name):
+    if isinstance(node, str):
+        return name(node)
+    return [_mapnames(x, name) for x in node]
+
+
+def _av(kw, a, R, subjects, permx, err, st):
+    if len(a) != 3 or not isinstance(a[2], list) or len(a[2]) < 2:
+        err(f"[{kw}] {st}")
+        return
+    srcs, tgts = subjects(a[0]), subjects(a[1])
+    cls = a[2][0]
+    perms = _perm_expr(a[2][1])
+    if not srcs or not tgts or not isinstance(cls, str) or perms is None:
+        err(f"[{kw}] unsupported form: {st}")
+        return
+    tgt = tgts[0] if len(tgts) == 1 else "{ " + " ".join(sorted(tgts)) + " }"
+    for s in srcs:
+        if perms[0] == "set":
+            R["av"][(kw, s, tgt, cls)] |= perms[1]
+        else:
+            R["raw_rules"][s].append(f"{kw} {s} {tgt}:{cls} {perms[1]};")
+
+
+def _avx(kw, a, R, subjects, permx, err, st):
+    if len(a) != 3:
+        err(f"[{kw}] {st}")
+        return
+    srcs, tgts = subjects(a[0]), subjects(a[1])
+    px = permx.get(a[2]) if isinstance(a[2], str) else a[2]
+    if not srcs or not tgts or not isinstance(px, list) or len(px) < 3:
+        err(f"[{kw}] unsupported form: {st}")
+        return
+    xtype, cls = px[0], px[1]
+    items = _xperm_items(px[2])
+    if items is None or not isinstance(cls, str):
+        err(f"[{kw}] unsupported xperm expr: {st}")
+        return
+    tgt = tgts[0] if len(tgts) == 1 else "{ " + " ".join(sorted(tgts)) + " }"
+    for s in srcs:
+        if items[0] == "set":
+            R["avx"][(AVX_ACTIONS[kw], s, tgt, cls, xtype)] |= items[1]
+        else:
+            R["raw_rules"][s].append(f"{AVX_ACTIONS[kw]} {s} {tgt}:{cls} {xtype} {items[1]};")
+
+
+def _genfs(a, sv):
+    fs, path = a[0], a[1].strip('"') if isinstance(a[1], str) else None
+    ftype = ""
+    ctx = a[-1]
+    if len(a) == 4 and isinstance(a[2], str):
+        ftype = GENFS_FTYPE.get(a[2], "")
+    if not path or not isinstance(ctx, list) or len(ctx) < 3:
         return None
-
-    type_name = _sv(m.group(1), version)
-    return f"genfscon {fs_type} {path} u:object_r:{type_name}:s0"
-
-
-# ---------------------------------------------------------------------------
-# Core CIL line tokeniser
-# ---------------------------------------------------------------------------
-
-def _tokenise(line: str) -> tuple:
-    """
-    Extract the keyword and raw argument string from a CIL S-expression line.
-
-    Input:  "(allow init_202404 hal_audio_default_exec (file (read getattr)))"
-    Output: ("allow", "init_202404 hal_audio_default_exec (file (read getattr))")
-
-    Returns (None, None) if the line is not a valid CIL statement.
-    """
-    line = line.strip()
-    if not line.startswith("(") or not line.endswith(")"):
-        return None, None
-
-    # Remove outer parens
-    inner = line[1:-1].strip()
-    # Split keyword from the rest
-    space_idx = inner.find(" ")
-    if space_idx == -1:
-        keyword = inner
-        rest = ""
-    else:
-        keyword = inner[:space_idx]
-        rest = inner[space_idx + 1:].strip()
-
-    return keyword, rest
-
-
-def _split_top_level(s: str) -> list:
-    """
-    Split a string into top-level tokens, respecting nested parentheses.
-
-    e.g. 'init_202404 hal_exec (file (read write))'
-      → ['init_202404', 'hal_exec', '(file (read write))']
-    """
-    tokens = []
-    depth = 0
-    current = []
-
-    for ch in s:
-        if ch == "(":
-            depth += 1
-            current.append(ch)
-        elif ch == ")":
-            depth -= 1
-            current.append(ch)
-            if depth == 0:
-                tokens.append("".join(current).strip())
-                current = []
-        elif ch in (" ", "\t") and depth == 0:
-            if current:
-                tokens.append("".join(current).strip())
-                current = []
-        else:
-            current.append(ch)
-
-    if current:
-        tokens.append("".join(current).strip())
-
-    return [t for t in tokens if t]
-
-
-# ---------------------------------------------------------------------------
-# Statement converters
-# ---------------------------------------------------------------------------
-
-def _convert_av_rule(keyword: str, rest: str, version: str) -> tuple:
-    """
-    Convert allow / dontaudit / neverallow.
-
-    CIL:  (allow SUBJECT TARGET (CLASS (PERM PERM)))
-    .te:   allow SUBJECT TARGET:CLASS { PERM PERM };
-
-    Returns (subject_name, te_line) or (None, None) on parse error.
-    """
-    tokens = _split_top_level(rest)
-    if len(tokens) < 3:
-        return None, None
-
-    subject = _sv(tokens[0], version)
-    target  = _sv(tokens[1], version)
-    # tokens[2] is like "(file (read write))" or "(file (read))"
-    class_block = tokens[2].strip()
-
-    if not (class_block.startswith("(") and class_block.endswith(")")):
-        return None, None
-
-    class_inner = class_block[1:-1].strip()
-    class_tokens = _split_top_level(class_inner)
-
-    if len(class_tokens) < 2:
-        return None, None
-
-    obj_class = class_tokens[0]
-    perms     = _parse_perm_list(class_tokens[1] if len(class_tokens) > 1 else class_tokens[0])
-
-    te_line = f"{keyword} {subject} {target}:{obj_class} {perms};"
-    return subject, te_line
-
-
-def _convert_typetransition(rest: str, version: str) -> tuple:
-    """
-    Convert typetransition.
-
-    Process transition:
-      CIL: (typetransition INIT EXEC process DOMAIN)
-      .te:  type_transition INIT EXEC:process DOMAIN;
-
-    File name transition:
-      CIL: (typetransition SOURCE PARENT dir NEW_TYPE "filename")
-      .te:  type_transition SOURCE PARENT:dir NEW_TYPE "filename";
-
-    Returns (subject, te_line).
-    """
-    tokens = _split_top_level(rest)
-    if len(tokens) < 4:
-        return None, None
-
-    subject = _sv(tokens[0], version)
-    exe     = _sv(tokens[1], version)
-    cls     = tokens[2]
-    new_type = _sv(tokens[3], version)
-
-    if len(tokens) == 4:
-        # process transition
-        te_line = f"type_transition {subject} {exe}:{cls} {new_type};"
-    else:
-        # file name transition — 5th token is the filename in quotes
-        filename = tokens[4]
-        te_line = f"type_transition {subject} {exe}:{cls} {new_type} {filename};"
-
-    return subject, te_line
-
-
-def _convert_allowx(rest: str, version: str) -> tuple:
-    """
-    Convert allowx (extended permissions — typically ioctl ranges).
-
-    CIL: (allowx SOURCE TARGET (ioctl CLASS (RANGE...)))
-    .te:  allowxperm SOURCE TARGET:CLASS ioctl { RANGE... };
-
-    Returns (subject, te_line).
-    """
-    tokens = _split_top_level(rest)
-    if len(tokens) < 3:
-        return None, None
-
-    subject = _sv(tokens[0], version)
-    target  = _sv(tokens[1], version)
-    perm_block = tokens[2]
-
-    if not (perm_block.startswith("(") and perm_block.endswith(")")):
-        return None, None
-
-    inner_tokens = _split_top_level(perm_block[1:-1])
-    if len(inner_tokens) < 3:
-        return None, None
-
-    perm_type  = inner_tokens[0]  # usually "ioctl"
-    obj_class  = inner_tokens[1]
-    xperms     = _parse_perm_list(inner_tokens[2] if len(inner_tokens) > 2 else "")
-
-    te_line = f"allowxperm {subject} {target}:{obj_class} {perm_type} {xperms};"
-    return subject, te_line
-
-
-def _convert_typeattributeset(rest: str, version: str) -> list:
-    """
-    Convert typeattributeset into per-member typeattribute lines.
-
-    CIL: (typeattributeset ATTR (T1 T2 T3 ...))
-    .te:  typeattribute T1 ATTR;
-          typeattribute T2 ATTR;
-          ...
-
-    Complex set expressions like:
-      (typeattributeset base_X (and (appdomain) (not (shell))))
-    are skipped — they use CIL boolean algebra that has no direct .te equivalent
-    and only appear in auto-generated base_typeattr_N intermediate attributes.
-
-    Returns list of (member_name, te_line) tuples.
-    """
-    tokens = _split_top_level(rest)
-    if len(tokens) < 2:
-        return []
-
-    attr = _sv(tokens[0], version)
-    members_block = tokens[1]
-
-    # Detect CIL set expressions (and/or/not/xor) — skip these entirely
-    # They look like: (and (appdomain) (not (shell)))
-    if members_block.startswith("("):
-        inner = members_block[1:-1].strip()
-        first_token = inner.split()[0] if inner.split() else ""
-        if first_token in ("and", "or", "not", "xor"):
-            return []  # skip complex boolean set expressions
-
-        # Plain list of type names: (T1 T2 T3)
-        members_raw = inner.split()
-    else:
-        # Single bare type name
-        members_raw = [members_block]
-
-    result = []
-    for m in members_raw:
-        # Skip anything that still has parens (nested expressions we missed)
-        if "(" in m or ")" in m:
-            continue
-        member = _sv(m, version)
-        te_line = f"typeattribute {member} {attr};"
-        result.append((member, te_line))
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Main parser
-# ---------------------------------------------------------------------------
-
-def parse_partition_cil(cil_lines: list, version: str, partition_name: str) -> dict:
-    """
-    Parse all CIL lines for one partition.
-
-    Returns:
-    {
-        "domains": {
-            "domain_name": {
-                "type_decl":  [...],
-                "attributes": [...],
-                "rules":      [...],
-            }
-        },
-        "global_attributes": { "attr_name": ["attribute attr_name;"] },
-        "genfs_contexts": [...],
-        "parse_errors": [...]
-    }
-    """
-
-    domains          = {}   # domain_name → { type_decl, attributes, rules }
-    global_attrs     = {}   # attribute name → declaration line
-    genfs_contexts   = []
-    parse_errors     = []
-    pending_aliases  = {}   # alias_name → None (waiting for typealiasactual)
-
-    def get_domain(name: str) -> dict:
-        if name not in domains:
-            domains[name] = {
-                "type_decl":  [],
-                "attributes": [],
-                "rules":      [],
-            }
-        return domains[name]
-
-    total = len(cil_lines)
-    dots  = max(1, total // 20)  # progress every 5%
-
-    print(f"  [parse] {partition_name}: processing {total} CIL lines...")
-
-    for i, raw_line in enumerate(cil_lines):
-        if i % dots == 0:
-            pct = int(i / total * 100)
-            print(f"  [parse] {pct:3d}% ({i}/{total})", end="\r")
-
-        line = raw_line.strip()
-        if not line or line.startswith(";"):
-            continue
-
-        keyword, rest = _tokenise(line)
-        if keyword is None:
-            continue
-
-        # ---- type declaration ----
-        if keyword == "type":
-            type_name = _sv(rest.strip(), version)
-            get_domain(type_name)["type_decl"].append(f"type {type_name};")
-
-        # ---- attribute declaration ----
-        elif keyword == "typeattribute":
-            attr_name = _sv(rest.strip(), version)
-            global_attrs[attr_name] = f"attribute {attr_name};"
-
-        # ---- typealias (just the name declaration, pair with typealiasactual) ----
-        elif keyword == "typealias":
-            alias_name = rest.strip()
-            pending_aliases[alias_name] = None
-
-        # ---- typealiasactual pairs with typealias ----
-        elif keyword == "typealiasactual":
-            tokens = _split_top_level(rest)
-            if len(tokens) >= 2:
-                alias_name = _sv(tokens[0], version)
-                real_name  = _sv(tokens[1], version)
-                te_line    = f"typealias {real_name} {alias_name};"
-                get_domain(real_name)["type_decl"].append(te_line)
-
-        # ---- typeattributeset → membership lines per member ----
-        elif keyword == "typeattributeset":
-            memberships = _convert_typeattributeset(rest, version)
-            for (member, te_line) in memberships:
-                get_domain(member)["attributes"].append(te_line)
-
-        # ---- allow / dontaudit / neverallow ----
-        elif keyword in ("allow", "dontaudit", "neverallow"):
-            subject, te_line = _convert_av_rule(keyword, rest, version)
-            if subject:
-                get_domain(subject)["rules"].append(te_line)
-            else:
-                parse_errors.append(f"[{keyword}] parse fail: {line[:80]}")
-
-        # ---- typetransition ----
-        elif keyword == "typetransition":
-            subject, te_line = _convert_typetransition(rest, version)
-            if subject:
-                get_domain(subject)["rules"].append(te_line)
-            else:
-                parse_errors.append(f"[typetransition] parse fail: {line[:80]}")
-
-        # ---- allowx (extended perms) ----
-        elif keyword == "allowx":
-            subject, te_line = _convert_allowx(rest, version)
-            if subject:
-                get_domain(subject)["rules"].append(te_line)
-            else:
-                parse_errors.append(f"[allowx] parse fail: {line[:80]}")
-
-        # ---- genfscon → goes to genfs_contexts ----
-        elif keyword == "genfscon":
-            parts = _split_top_level(rest)
-            result = _parse_genfscon(parts, version)
-            if result:
-                genfs_contexts.append(result)
-            else:
-                parse_errors.append(f"[genfscon] parse fail: {line[:80]}")
-
-        # ---- expandtypeattribute ----
-        elif keyword == "expandtypeattribute":
-            tokens = _split_top_level(rest)
-            if len(tokens) >= 2:
-                # (expandtypeattribute (T1 T2) true)
-                type_block = tokens[0]
-                value      = tokens[1]
-                if type_block.startswith("(") and type_block.endswith(")"):
-                    type_list = type_block[1:-1].split()
-                else:
-                    type_list = [type_block]
-                for t in type_list:
-                    tname = _sv(t, version)
-                    get_domain(tname)["rules"].append(
-                        f"expandtypeattribute {tname} {value};"
-                    )
-
-        # ---- roletype — skip, not needed in .te output ----
-        elif keyword == "roletype":
-            pass
-
-        # ---- anything else we don't handle yet ----
-        else:
-            pass  # silently skip unknown keywords
-
-    print(f"  [parse] 100% ({total}/{total}) — done.          ")
-
-    return {
-        "domains":           domains,
-        "global_attributes": global_attrs,
-        "genfs_contexts":    genfs_contexts,
-        "parse_errors":      parse_errors,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Top-level entry point
-# ---------------------------------------------------------------------------
+    level = "s0"
+    try:
+        lv = ctx[3][0]
+        level = lv[0] if isinstance(lv, list) and lv and isinstance(lv[0], str) else "s0"
+    except Exception:
+        pass
+    parts = ["genfscon", fs, path] + ([ftype] if ftype else [])
+    return " ".join(parts) + f" {ctx[0]}:{ctx[1]}:{sv(ctx[2])}:{level}"
+
+
+# --------------------------------------------------------------------------
+# typeattributeset resolution (supports and/or/not/xor/all, nested attrs)
+# --------------------------------------------------------------------------
+
+class _Resolver:
+    def __init__(self, results: dict):
+        self.all_types, self.all_attrs = set(), set()
+        self.sets = defaultdict(list)           # attr -> [expr, ...]
+        for r in results.values():
+            self.all_types |= r["types"]
+            self.all_attrs |= r["attributes"]
+            for attr, expr in r["attrsets"]:
+                self.sets[attr].append(expr)
+                self.all_attrs.add(attr)
+        self.memo, self.busy, self.unresolved = {}, set(), []
+
+    def members(self, name):
+        if name not in self.all_attrs:
+            return {name}
+        if name in self.memo:
+            return self.memo[name]
+        if name in self.busy:
+            return set()
+        self.busy.add(name)
+        out = set()
+        for e in self.sets.get(name, []):
+            out |= self.ev(e)
+        self.busy.discard(name)
+        self.memo[name] = out
+        return out
+
+    def ev(self, e):
+        if isinstance(e, str):
+            return set(self.all_types) if e == "all" else self.members(e)
+        if not e:
+            return set()
+        h = e[0]
+        if h == "all":
+            return set(self.all_types)
+        if h == "not":
+            return set(self.all_types) - self.ev(e[1]) if len(e) > 1 else set()
+        if h in ("and", "or", "xor") and len(e) >= 2:
+            parts = [self.ev(x) for x in e[1:]]
+            acc = parts[0]
+            for p in parts[1:]:
+                acc = acc & p if h == "and" else acc | p if h == "or" else acc ^ p
+            return acc
+        out = set()
+        for x in e:
+            out |= self.ev(x)
+        return out
+
+
+def _resolve(results: dict):
+    rs = _Resolver(results)
+    for pname, r in results.items():
+        for attr, expr in r["attrsets"]:
+            for m in rs.ev(expr):
+                if m in rs.all_attrs:
+                    continue
+                r["type_attrs"][m].add(attr)
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
 
 def parse_all_cil(data: dict) -> dict:
-    """
-    Parse CIL for all partitions.
-
-    Parameters
-    ----------
-    data : dict
-        Output from reader.read_staged()
-
-    Returns
-    -------
-    dict  {partition_name: parse_result, ...}
-    """
-    version = data.get("plat_version") or DEFAULT_PLAT_VERSION
-    print(f"\n[CIL] Using platform version suffix: _{version}")
-
+    hints = normalize_version(data.get("plat_version") or DEFAULT_PLAT_VERSION)
     results = {}
-
     for pname, pdata in data["partitions"].items():
-        cil_lines = pdata.get("cil_lines", [])
-        if not cil_lines:
+        lines = pdata.get("cil_lines", [])
+        if not lines:
             print(f"\n[CIL] Skipping {pname} — no CIL lines")
             continue
+        suffix = detect_suffix(lines, hints)
+        print(f"\n[CIL] Parsing {pname}: {len(lines)} lines, version suffix _{suffix}")
+        r = parse_partition_cil(lines, suffix, pname)
+        r["suffix"] = suffix
+        results[pname] = r
 
-        print(f"\n[CIL] Parsing partition: {pname}")
-        result = parse_partition_cil(cil_lines, version, pname)
+    _resolve(results)
 
-        domain_count  = len(result["domains"])
-        genfs_count   = len(result["genfs_contexts"])
-        error_count   = len(result["parse_errors"])
-        attr_count    = len(result["global_attributes"])
-
-        print(f"  [done] domains={domain_count}  attributes={attr_count}  "
-              f"genfscon={genfs_count}  errors={error_count}")
-
-        if result["parse_errors"]:
-            print(f"  [warn] First 5 parse errors:")
-            for e in result["parse_errors"][:5]:
-                print(f"         {e}")
-
-        results[pname] = result
-
+    for pname, r in results.items():
+        n_rules = sum(len(v) for v in r["av"].values())
+        print(f"  [{pname}] types={len(r['types'])} attrs={len(r['attributes'])} "
+              f"av-keys={len(r['av'])} perms={n_rules} xperm-keys={len(r['avx'])} "
+              f"type_transition={len(r['tt'])} genfscon={len(r['genfs_contexts'])} "
+              f"errors={len(r['parse_errors'])}")
+        for e in r["parse_errors"][:5]:
+            print(f"      ! {e}")
+        notable = {k: v for k, v in r["unhandled"].items()}
+        if notable:
+            print(f"      ignored statements: {dict(notable)}")
+        # drop the raw (unresolved) expressions to keep memory small
+        r["attrsets"] = []
     return results

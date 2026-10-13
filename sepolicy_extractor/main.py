@@ -22,6 +22,7 @@ from reader import read_staged, print_read_summary
 from cil_parser import parse_all_cil
 from contexts_writer import write_contexts
 from writer import write_output
+from verify import verify_semantics
 
 
 def resolve_output_dir(custom_out: str | None) -> str:
@@ -47,6 +48,13 @@ def validate_dump_path(dump_path: str) -> str:
     return abs_path
 
 
+def _is_inside(child: str, parent: str) -> bool:
+    try:
+        return os.path.commonpath([child, parent]) == parent
+    except ValueError:
+        return False
+
+
 def clean_output_dir(out_dir: str):
     """Wipe out the old output directory to prevent ghost folders from previous runs."""
     if os.path.exists(out_dir):
@@ -55,7 +63,7 @@ def clean_output_dir(out_dir: str):
     os.makedirs(out_dir, exist_ok=True)
 
 
-def verify_output(out_dir: str):
+def verify_output(out_dir: str, report: dict = None) -> int:
     """
     Post-Extraction Verification Check.
     Validates Folder Structuring, Braces Matching, and Empty Files.
@@ -101,7 +109,7 @@ def verify_output(out_dir: str):
             if file.endswith(".te"):
                 te_files += 1
                 with open(filepath, 'r', encoding='utf-8') as f:
-                    content = f.read()
+                    content = "\n".join(l.split("#", 1)[0] for l in f.read().splitlines())
                     if content.count('{') != content.count('}'):
                         print(f"  [ERROR] Unbalanced braces in {os.path.relpath(filepath, out_dir)}")
                         brace_errors += 1
@@ -121,11 +129,21 @@ def verify_output(out_dir: str):
 
     print(f"[OK] Successfully validated {te_files} .te files and {ctx_files} context aggregates.")
 
+    if report:
+        print("\n  [VERIFY] Semantic check: written .te vs. stock CIL (macros expanded)")
+        sem = verify_semantics(out_dir, report)
+        if sem:
+            errors += 1
+            print(f"  [ERROR] {sem} semantic differences (see above)")
+        else:
+            print("  [OK] Output grants EXACTLY what the stock policy grants.")
+
     print("-" * 60)
     if errors == 0:
         print(f"  [SUCCESS] Extraction & Verification Passed! (Warnings: {warnings})")
     else:
         print(f"  [FAILED] Verification Failed with {errors} Errors.")
+    return errors
 
 
 def parse_args() -> argparse.Namespace:
@@ -155,6 +173,19 @@ Examples:
         default=False,
         help="Keep the temporary staging directory after extraction (useful for debugging)"
     )
+    parser.add_argument("--global-macros", default=None, metavar="PATH",
+                        help="AOSP public/global_macros (file or dir). Perm macros "
+                             "(rx_file_perms ...) are then taken from YOUR tree instead of built-ins.")
+    parser.add_argument("--te-macros", default=None, metavar="PATH",
+                        help="AOSP public/te_macros (file or dir). Domain macros (get_prop, "
+                             "binder_use ...) are only used if defined there.")
+    parser.add_argument("--variant-macros", action="store_true",
+                        help="Allow add_service() even when the dump lacks its userdebug-only su rule "
+                             "(compact, but not byte-exact for user builds).")
+    parser.add_argument("--no-perm-macros", action="store_true",
+                        help="Never use *_file_perms/*_dir_perms macros; write explicit perms.")
+    parser.add_argument("--no-domain-macros", action="store_true",
+                        help="Never use get_prop/set_prop/binder_use/... macros.")
     return parser.parse_args()
 
 
@@ -179,13 +210,13 @@ def main():
     out_real  = os.path.realpath(out_dir)
     tmp_real  = os.path.realpath(tmp_dir)
 
-    if out_real.startswith(dump_real):
+    if _is_inside(out_real, dump_real):
         print(f"[ERROR] Output directory cannot be inside the dump path!")
         print(f"        dump : {dump_real}")
         print(f"        out  : {out_real}")
         sys.exit(1)
 
-    if tmp_real.startswith(dump_real):
+    if _is_inside(tmp_real, dump_real):
         print(f"[ERROR] Temp directory cannot be inside the dump path!")
         sys.exit(1)
 
@@ -217,10 +248,13 @@ def main():
     write_contexts(data, parsed, out_dir)
 
     # --- Part 5: Write .te files (Pass Data for API mapping) ---
-    write_output(parsed, data, out_dir)
+    report = write_output(parsed, data, out_dir, options={
+        "global_macros": args.global_macros, "te_macros": args.te_macros,
+        "no_perm_macros": args.no_perm_macros, "variant_macros": args.variant_macros, "no_domain_macros": args.no_domain_macros,
+    })
 
     # --- Part 6: Validate output ---
-    verify_output(out_dir)
+    failed = verify_output(out_dir, report)
 
     print("\n[INFO] Extraction complete.")
 
@@ -231,6 +265,9 @@ def main():
             print(f"[INFO] Temp dir cleaned up: {tmp_dir}")
     else:
         print(f"[INFO] Temp dir kept at: {tmp_dir}")
+
+    if failed:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

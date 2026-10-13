@@ -35,112 +35,8 @@ VENDOR_EXTRA =[
     "selinux_denial_metadata",
 ]
 
-TAXONOMY = {
-    "System Core & Framework": {
-        "System Services":["system_server", "activity", "package", "window", "servicemanager", "hwservicemanager", "vndservicemanager"],
-        "Init & Core Daemons":["init", "vold", "logd", "ueventd", "watchdogd", "llkd", "lmkd", "zygote"],
-        "Kernel & Devices":["kernel", "devices", "module", "i2c", "pwrap", "consys", "driver", "blockio"]
-    },
-    "Fingerprint & Biometrics": {
-        "Biometric Core":["biometrics", "fingerprint_service", "fingerprintextension", "fps"],
-        "Biometric Vendor":["goodix", "fpc", "soter", "virtual_face", "jiiov"],
-        "Biometric Modalities":["fingerprint", "faceauth", "iris", "voiceprint"]
-    },
-    "Camera": {
-        "Camera Effects":["lomoeffect", "filters", "beautify"],
-        "Camera Framework":["camera.bgservice", "postproc", "ccap", "camerapostalgo"],
-        "Camera HAL":["camera", "isphal", "lens"]
-    },
-    "Audio & Video": {
-        "Voice & Call Audio":["in_call", "voip", "telecom", "audiocmd"],
-        "Media Framework":["omx", "media", "mediaserver", "mediacodec", "mediaextractor", "mediadrm", "mediatranscoding", "mediatuner", "codec", "extractor"],
-        "Audio HAL":["audio", "mixer", "sound", "dolby", "dms"]
-    },
-    "Display & Graphics": {
-        "Compositing":["surfaceflinger", "composer"],
-        "GPU Stack":["graphics", "gpu", "mali", "vulkan", "opengl"],
-        "Display Pipeline":["display", "hwc", "hardware.pq", "dfps", "hdmi"]
-    },
-    "Radio & Telephony": {
-        "IMS & VoLTE":["ims", "volte", "isap", "sap", "uce", "rcs"],
-        "Messaging":["sms", "isms"],
-        "Modem & RIL":["radio", "ril", "modem", "telephony", "cdma"]
-    },
-    "Network (Wi-Fi, BT, NFC)": {
-        "Bluetooth Stack":["bluetooth", "bt_hal", "btdbg"],
-        "Proximity & Short-range":["nfc", "uwb", "nxp", "secure_element"],
-        "Wi-Fi Stack":["wifi", "wlan", "netd", "macsec", "supplicant", "hotspot"]
-    },
-    "Power & Thermal": {
-        "Battery & Charging":["battery", "charger", "charge", "charging", "fuelgauge", "fuel_gauge", "kpoc", "power_supply"],
-        "Thermal Control":["thermal", "thermald", "cooling", "mi_thermald"],
-        "Power Management":["power", "perf", "governor", "mtkpower"]
-    },
-    "Sensors & Location": {
-        "Location Stack":["gnss", "gps", "agps", "lbs", "mnld"],
-        "Sensor HAL":["sensor", "presence", "sensorhub", "contexthub"]
-    },
-    "Security & TEE": {
-        "Crypto Services":["keymaster", "keymint", "keystore", "keymanage", "authgraph"],
-        "Authentication Services":["gatekeeper", "weaver", "authsecret", "secretkeeper"],
-        "TEE Core":["teei", "trustonic", "microtrust", "nxpese", "tee", "mitee", "soter"]
-    },
-    "Input & Touch": {
-        "Touchscreen":["touch", "tp_"],
-        "Input Devices":["input", "keypad", "keyboard", "mouse"]
-    },
-    "Hardware & Peripheral": {
-        "USB":["usb", "typec", "xhci", "musb"],
-        "Vibrator":["vibrator", "haptic"],
-        "LEDs":["leds", "flashlight", "torch"]
-    },
-    "AI & Neural Networks": {
-        "AI Accelerators":["neuron", "apuware", "neuropilot", "xrp", "hmp"],
-        "NN Runtime":["neuralnetworks", "nnapi", "hal_nn"]
-    },
-    "Storage & Memory": {
-        "Block Devices":["mmc", "ufs", "flash", "mtd", "blk_", "zram"],
-        "NVRAM & Calibration":["nvram", "oem_cali", "factory", "meta_tst", "persist"],
-        "Volume Management":["vold", "sdcard", "storage", "fuse", "exfat", "vfat", "firmware"]
-    },
-    "Apps & UX": {
-        "Privileged/OEM Apps":["launcher", "updater", "diagapp", "permissioncontroller"],
-        "System Apps":["settings", "dialer", "systemui"],
-        "Third-party Apps":["untrusted_app", "isolated_app", "ephemeral_app", "sdk_sandbox"]
-    },
-    "Connectivity & Internet": {
-        "Generic Network Services":["dns", "dhcp", "tether", "vpn", "firewall", "clatd", "ppp"],
-        "Data Management":["quota", "bandwidth"]
-    },
-    "Debug, Logging & Diagnostics": {
-        "Debug tools":["adb", "shell", "debuggerd", "simpleperf", "crash_dump", "tombstone", "debugfs"],
-        "OEM Diagnostics":["diag", "engineer", "atci", "dtool"],
-        "Logging":["logcat", "logd", "statsd", "traced", "mdlogger", "logger", "log_"]
-    },
-    "Update & Provisioning": {
-        "Provisioning & Enrollment":["device_setup", "provision", "rkpd"],
-        "OTA & Partitions":["update_engine", "otapreopt", "recovery", "boot_control", "cppreopts", "fastboot"]
-    }
-}
+from taxonomy import TAXONOMY, VENDORS, get_vendor as _get_vendor, kw_match, _tokens
 
-VENDORS = {
-    "MediaTek":["mtk", "mediatek"],
-    "Qualcomm":["qcom", "qualcomm", "qti"],
-    "Exynos":["exynos", "slsi"],
-    "Xiaomi":["xiaomi", "miui"],
-    "Goodix":["goodix"],
-    "Jiiov":["jiiov"],
-    "NXP":["nxp"],
-    "Samsung":["samsung", "sec"],
-    "Trustonic":["trustonic", "microtrust", "teei"]
-}
-
-def _get_vendor(name: str) -> str:
-    lower = name.lower()
-    for v, kws in VENDORS.items():
-        if any(kw in lower for kw in kws):
-            return v
-    return "AOSP / Generic"
 
 def _ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
@@ -195,13 +91,14 @@ def _format_and_align_contexts(lines: list, categorize: bool = False, owner_firs
 
         for left, right in parsed:
             search_str = left.lower().replace("mediatek", "mtk")
+            _tk = _tokens(search_str)
             assigned = False
             vendor = _get_vendor(left)
             
             for cat, subcats in TAXONOMY.items():
                 if assigned: break
                 for subcat, keywords in subcats.items():
-                    if any(kw in search_str for kw in keywords):
+                    if any(kw_match(kw, search_str, _tk) for kw in keywords):
                         if owner_first:
                             grouped[vendor][cat].append((left, right))
                         else:
@@ -246,57 +143,83 @@ def _format_and_align_contexts(lines: list, categorize: bool = False, owner_firs
             
     return formatted
 
+# Files that must be copied byte-for-byte (they are XML / CIL / free text, NOT
+# "<key> <context>" lines; sorting/deduping/stripping comments destroys them).
+VERBATIM = {"mac_permissions.xml", "plat_pub_versioned.cil",
+            "plat_sepolicy_vers.txt", "selinux_denial_metadata"}
+# Files whose line ORDER is meaningful - never sorted, comments kept.
+ORDER_SENSITIVE = {"seapp_contexts"}
+
+
 def write_contexts(data: dict, parsed: dict, out_dir: str):
-    print(f"\n[CTX] Writing aligned, sorted, and categorized context files to: {out_dir}")
+    print(f"\n[CTX] Writing context files to: {out_dir}")
     aggregated = {"private": {}, "vendor": {}, "public": {}}
+    verbatim = []   # (path, lines)
 
     for partition_name, partition_data in data["partitions"].items():
-        tier = "vendor" if partition_name in["vendor", "odm"] else "private"
+        tier = "vendor" if partition_name in ["vendor", "odm"] else "private"
         prefix = PARTITION_PREFIX.get(partition_name, partition_name)
         contexts = partition_data.get("contexts", {})
 
         for output_name in CONTEXT_OUTPUT_NAMES:
-            src_key = f"{prefix}_{output_name}"
-            if src_key in contexts and contexts[src_key]:
-                if output_name not in aggregated[tier]: aggregated[tier][output_name] = {}
-                aggregated[tier][output_name][partition_name] = contexts[src_key]
+            lines = contexts.get(f"{prefix}_{output_name}")
+            if not lines:
+                continue
+            if output_name in VERBATIM:
+                verbatim.append((os.path.join(out_dir, tier, f"{prefix}_{output_name}"), lines))
+            else:
+                aggregated[tier].setdefault(output_name, {})[partition_name] = lines
 
         if partition_name == "vendor":
             for fname in VENDOR_EXTRA:
-                if fname in contexts and contexts[fname]:
-                    if fname not in aggregated[tier]: aggregated[tier][fname] = {}
-                    aggregated[tier][fname][partition_name] = contexts[fname]
+                lines = contexts.get(fname)
+                if not lines:
+                    continue
+                if fname in VERBATIM:
+                    verbatim.append((os.path.join(out_dir, tier, fname), lines))
+                else:
+                    aggregated[tier].setdefault(fname, {})[partition_name] = lines
 
         if partition_name in parsed:
-            genfs = parsed[partition_name].get("genfs_contexts",[])
+            genfs = parsed[partition_name].get("genfs_contexts", [])
             if genfs:
-                if "genfs_contexts" not in aggregated[tier]: aggregated[tier]["genfs_contexts"] = {}
-                aggregated[tier]["genfs_contexts"][partition_name] = genfs
+                aggregated[tier].setdefault("genfs_contexts", {})[partition_name] = genfs
 
+    # --- verbatim copies -------------------------------------------------
+    for path, lines in verbatim:
+        _write_raw(path, lines)
+        print(f"  [copy ] {os.path.relpath(path, out_dir)}  (verbatim)")
+
+    # --- aligned / sorted / categorised -----------------------------------
     for tier, files in aggregated.items():
-        if not files: continue
-        tier_dir = os.path.join(out_dir, tier)
-        
         for fname, partition_dict in files.items():
-            final_lines =[f"# {fname} - Generated by sepolicy_extract", ""]
-            
-            owner_first = any(x in fname for x in["file_contexts", "genfs_contexts"])
-            categorize = True
-            
-            for part_name in sorted(partition_dict.keys()):
+            final_lines = [f"# {fname} - Generated by sepolicy_extract", ""]
+            ordered = fname in ORDER_SENSITIVE
+            owner_first = any(x in fname for x in ["file_contexts", "genfs_contexts"])
+
+            for part_name in sorted(partition_dict):
                 raw_lines = partition_dict[part_name]
-                aligned_block = _format_and_align_contexts(raw_lines, categorize=categorize, owner_first=owner_first)
-                
-                if aligned_block:
-                    final_lines.append(f"# {'=' * 40}")
-                    final_lines.append(f"# Partition: {part_name}")
-                    final_lines.append(f"# {'=' * 40}")
-                    final_lines.append("")
-                    final_lines.extend(aligned_block)
-                    final_lines.append("")
-            
-            out_path = os.path.join(tier_dir, fname)
-            _write_lines(out_path, final_lines)
-            print(f"  [write] {tier}/{fname}  (Taxonomy Applied)")
+                if ordered:
+                    block = [l for l in raw_lines]          # untouched, incl. comments
+                else:
+                    block = _format_and_align_contexts(raw_lines, categorize=True,
+                                                       owner_first=owner_first)
+                if block:
+                    final_lines += [f"# {'=' * 40}", f"# Partition: {part_name}",
+                                    f"# {'=' * 40}", ""] + block + [""]
+
+            out_path = os.path.join(out_dir, tier, fname)
+            if ordered:
+                _write_raw(out_path, final_lines)
+            else:
+                _write_lines(out_path, final_lines)
+            print(f"  [write] {tier}/{fname}" + ("  (order preserved)" if ordered else ""))
 
     print("\n[CTX] Context writing complete.")
+
+
+def _write_raw(filepath: str, lines: list):
+    _ensure_dir(os.path.dirname(filepath))
+    with open(filepath, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")

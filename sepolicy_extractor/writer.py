@@ -1,123 +1,50 @@
 """
 writer.py — Part 5 of the pipeline.
 
-Assembles the final per-domain (or grouped) .te files from the parsed CIL data.
-Implements modern property macros, macro condensation, rule deduplication, 
-advanced Taxonomy headers/sorters, and pristine blank-line spacing logic.
+Builds one merged policy index per tier-family
+    platform = system + system_ext + product   -> private/ + public/
+    vendor   = vendor + odm                    -> vendor/
+condenses it (lossless perm macros + verified domain macros) and writes ONE .te
+per group.
+
+FIXED vs. the previous writer
+  * Different partitions used to write to the SAME path (e.g. system and
+    system_ext both -> private/property.te, vendor and odm -> vendor/file.te)
+    with mode "w": the last partition silently overwrote the others.
+  * rx_file_perms & friends were chosen by "trigger perms" and widened rules.
+  * `typealias` was emitted without the `alias` keyword (does not compile).
+  * type_transition with a file name had name/new_type swapped.
+  * allowx ranges were mangled; auditallow/permissive/typebounds were dropped.
+  * attribute removal in property macros dropped attributes the macro does not imply.
 """
 
 import os
 import re
 from collections import defaultdict
 
-TAXONOMY = {
-    "System Core & Framework": {
-        "System Services":["system_server", "activity", "package", "window", "servicemanager", "hwservicemanager", "vndservicemanager"],
-        "Init & Core Daemons":["init", "vold", "logd", "ueventd", "watchdogd", "llkd", "lmkd", "zygote"],
-        "Kernel & Devices":["kernel", "devices", "module", "i2c", "pwrap", "consys", "driver", "blockio"]
-    },
-    "Fingerprint & Biometrics": {
-        "Biometric Core":["biometrics", "fingerprint_service", "fingerprintextension", "fps"],
-        "Biometric Vendor":["goodix", "fpc", "soter", "virtual_face", "jiiov"],
-        "Biometric Modalities":["fingerprint", "faceauth", "iris", "voiceprint"]
-    },
-    "Camera": {
-        "Camera Effects":["lomoeffect", "filters", "beautify"],
-        "Camera Framework":["camera.bgservice", "postproc", "ccap", "camerapostalgo"],
-        "Camera HAL":["camera", "isphal", "lens"]
-    },
-    "Audio & Video": {
-        "Voice & Call Audio":["in_call", "voip", "telecom", "audiocmd"],
-        "Media Framework":["omx", "media", "mediaserver", "mediacodec", "mediaextractor", "mediadrm", "mediatranscoding", "mediatuner", "codec", "extractor"],
-        "Audio HAL":["audio", "mixer", "sound", "dolby", "dms"]
-    },
-    "Display & Graphics": {
-        "Compositing":["surfaceflinger", "composer"],
-        "GPU Stack":["graphics", "gpu", "mali", "vulkan", "opengl"],
-        "Display Pipeline":["display", "hwc", "hardware.pq", "dfps", "hdmi"]
-    },
-    "Radio & Telephony": {
-        "IMS & VoLTE":["ims", "volte", "isap", "sap", "uce", "rcs"],
-        "Messaging":["sms", "isms"],
-        "Modem & RIL":["radio", "ril", "modem", "telephony", "cdma"]
-    },
-    "Network (Wi-Fi, BT, NFC)": {
-        "Bluetooth Stack":["bluetooth", "bt_hal", "btdbg"],
-        "Proximity & Short-range":["nfc", "uwb", "nxp", "secure_element"],
-        "Wi-Fi Stack":["wifi", "wlan", "netd", "macsec", "supplicant", "hotspot"]
-    },
-    "Power & Thermal": {
-        "Battery & Charging":["battery", "charger", "charge", "charging", "fuelgauge", "fuel_gauge", "kpoc", "power_supply"],
-        "Thermal Control":["thermal", "thermald", "cooling", "mi_thermald"],
-        "Power Management":["power", "perf", "governor", "mtkpower"]
-    },
-    "Sensors & Location": {
-        "Location Stack":["gnss", "gps", "agps", "lbs", "mnld"],
-        "Sensor HAL":["sensor", "presence", "sensorhub", "contexthub"]
-    },
-    "Security & TEE": {
-        "Crypto Services":["keymaster", "keymint", "keystore", "keymanage", "authgraph"],
-        "Authentication Services":["gatekeeper", "weaver", "authsecret", "secretkeeper"],
-        "TEE Core":["teei", "trustonic", "microtrust", "nxpese", "tee", "mitee", "soter"]
-    },
-    "Input & Touch": {
-        "Touchscreen":["touch", "tp_"],
-        "Input Devices":["input", "keypad", "keyboard", "mouse"]
-    },
-    "Hardware & Peripheral": {
-        "USB":["usb", "typec", "xhci", "musb"],
-        "Vibrator":["vibrator", "haptic"],
-        "LEDs":["leds", "flashlight", "torch"]
-    },
-    "AI & Neural Networks": {
-        "AI Accelerators":["neuron", "apuware", "neuropilot", "xrp", "hmp"],
-        "NN Runtime":["neuralnetworks", "nnapi", "hal_nn"]
-    },
-    "Storage & Memory": {
-        "Block Devices":["mmc", "ufs", "flash", "mtd", "blk_", "zram"],
-        "NVRAM & Calibration":["nvram", "oem_cali", "factory", "meta_tst", "persist"],
-        "Volume Management":["vold", "sdcard", "storage", "fuse", "exfat", "vfat", "firmware"]
-    },
-    "Apps & UX": {
-        "Privileged/OEM Apps":["launcher", "updater", "diagapp", "permissioncontroller"],
-        "System Apps":["settings", "dialer", "systemui"],
-        "Third-party Apps":["untrusted_app", "isolated_app", "ephemeral_app", "sdk_sandbox"]
-    },
-    "Connectivity & Internet": {
-        "Generic Network Services":["dns", "dhcp", "tether", "vpn", "firewall", "clatd", "ppp"],
-        "Data Management":["quota", "bandwidth"]
-    },
-    "Debug, Logging & Diagnostics": {
-        "Debug tools":["adb", "shell", "debuggerd", "simpleperf", "crash_dump", "tombstone", "debugfs"],
-        "OEM Diagnostics":["diag", "engineer", "atci", "dtool"],
-        "Logging":["logcat", "logd", "statsd", "traced", "mdlogger", "logger", "log_"]
-    },
-    "Update & Provisioning": {
-        "Provisioning & Enrollment":["device_setup", "provision", "rkpd"],
-        "OTA & Partitions":["update_engine", "otapreopt", "recovery", "boot_control", "cppreopts", "fastboot"]
-    }
+from taxonomy import classify, get_vendor
+from perm_macros import PermMacros, parse_global_macros
+import macro_condenser as mc
+from cil_parser import read_sexps
+
+FAMILIES = {
+    "platform": ["system", "system_ext", "product"],
+    "vendor":   ["vendor", "odm"],
 }
 
-VENDORS = {
-    "MediaTek":["mtk", "mediatek"],
-    "Qualcomm":["qcom", "qualcomm", "qti"],
-    "Exynos":["exynos", "slsi"],
-    "Xiaomi":["xiaomi", "miui"],
-    "Goodix":["goodix"],
-    "Jiiov":["jiiov"],
-    "NXP":["nxp"],
-    "Samsung":["samsung", "sec"],
-    "Trustonic":["trustonic", "microtrust", "teei"]
+DEFAULT_PROP_MACROS = {
+    "system_internal_prop", "system_restricted_prop", "system_public_prop",
+    "vendor_internal_prop", "vendor_restricted_prop", "vendor_public_prop",
+    "product_internal_prop", "product_restricted_prop", "product_public_prop",
 }
+PROP_OWNERS = ("system", "vendor", "product", "system_ext")
+PROP_SCOPES = ("public", "internal", "restricted")
+ACTION_ORDER = {"allow": 0, "auditallow": 1, "dontaudit": 2, "neverallow": 3}
+
 
 def get_taxonomy(name: str) -> tuple:
     lower = name.lower()
-    
-    vendor = "AOSP / Generic"
-    for v, kws in VENDORS.items():
-        if any(kw in lower for kw in kws):
-            vendor = v
-            break
+    vendor = get_vendor(name)
 
     if "hal_" in lower or lower.endswith("_hal"): role = "HAL"
     elif "app" in lower:
@@ -130,14 +57,11 @@ def get_taxonomy(name: str) -> tuple:
     elif "prop" in lower: role = "PROPERTY"
     else: role = "NATIVE / MISC"
 
-    search_str = lower.replace("mediatek", "mtk")
-    
-    for cat, subcats in TAXONOMY.items():
-        for subcat, keywords in subcats.items():
-            if any(kw in search_str for kw in keywords):
-                return (cat, subcat, role, vendor)
-                
+    hit = classify(name)
+    if hit:
+        return (hit[0], hit[1], role, vendor)
     return ("Uncategorized", "Misc", role, vendor)
+
 
 def get_group_name(name: str) -> str:
     if name.endswith("_prop") or "property" in name: return "property"
@@ -184,422 +108,307 @@ def get_group_name(name: str) -> str:
 
     return base
 
-# ---------------------------------------------------------------------------
-# Property Transformers
-# ---------------------------------------------------------------------------
-
-def _transform_property(domain_name: str, type_decls: list, attributes: list) -> tuple:
-    MACRO_MAP = {
-        "system_internal_property_type": "system_internal_prop",
-        "system_restricted_property_type": "system_restricted_prop",
-        "system_public_property_type": "system_public_prop",
-        "system_vendor_config_property_type": "system_vendor_config_prop",
-        "vendor_internal_property_type": "vendor_internal_prop",
-        "vendor_restricted_property_type": "vendor_restricted_prop",
-        "vendor_public_property_type": "vendor_public_prop",
-        "product_internal_property_type": "product_internal_prop",
-        "product_restricted_property_type": "product_restricted_prop",
-        "product_public_property_type": "product_public_prop",
-        "system_ext_internal_property_type": "system_ext_internal_prop",
-        "system_ext_restricted_property_type": "system_ext_restricted_prop",
-        "system_ext_public_property_type": "system_ext_public_prop",
-    }
-    
-    attr_set = set()
-    for attr_line in attributes:
-        parts = attr_line.strip(";").split()
-        if len(parts) >= 3 and parts[0] == "typeattribute":
-            attr_set.add(parts[2])
-            
-    prop_macro = None
-    for attr, macro in MACRO_MAP.items():
-        if attr in attr_set:
-            prop_macro = macro
-            break
-            
-    is_prop = (prop_macro is not None) or ("property_type" in attr_set) or (domain_name.endswith("_prop"))
-    if not is_prop:
-        return type_decls, attributes
-        
-    new_type_decls =[]
-    new_attributes =[]
-    
-    implied_attrs = {"property_type", "system_property_type", "vendor_property_type", 
-                     "product_property_type", "system_ext_property_type"}
-    if prop_macro:
-        for attr, macro in MACRO_MAP.items():
-            if macro == prop_macro:
-                implied_attrs.add(attr)
-                
-    for attr_line in attributes:
-        parts = attr_line.strip(";").split()
-        if len(parts) >= 3 and parts[0] == "typeattribute":
-            if prop_macro and parts[2] in implied_attrs:
-                continue
-        new_attributes.append(attr_line)
-        
-    for decl in type_decls:
-        if decl.startswith(f"type {domain_name};") and prop_macro:
-            continue
-        new_type_decls.append(decl)
-            
-    if prop_macro:
-        new_type_decls.insert(0, f"{prop_macro}({domain_name})")
-        
-    return new_type_decls, new_attributes
 
 # ---------------------------------------------------------------------------
-# Trigger-Based Permission Compression
+# Merged policy index (one per family)
 # ---------------------------------------------------------------------------
 
-class PermMacro:
-    def __init__(self, name, triggers, swallows):
-        self.name = name
-        self.triggers = set(triggers)
-        self.swallows = set(swallows)
+class Index:
+    def __init__(self):
+        self.types, self.attributes = set(), set()
+        self.type_attrs = defaultdict(set)
+        self.aliases = defaultdict(set)
+        self.av = defaultdict(set)
+        self.avx = defaultdict(set)
+        self.tt = {}
+        self.other_tt = []
+        self.raw_rules = defaultdict(list)
+        self.permissive, self.expand, self.typebounds = set(), {}, set()
+        self.partitions = []
+        self.prop_types = set()
 
-OPT_PERMS = {"map", "watch", "watch_reads", "watch_mount", "watch_with_perm", "watch_sb", "ioctl"}
+    def merge(self, pname, r):
+        self.partitions.append(pname)
+        self.types |= r["types"]
+        self.attributes |= r["attributes"]
+        for k, v in r["type_attrs"].items():
+            self.type_attrs[k] |= v
+        for k, v in r["aliases"].items():
+            self.aliases[k] |= v
+        for k, v in r["av"].items():
+            self.av[k] |= v
+        for k, v in r["avx"].items():
+            self.avx[k] |= v
+        self.tt.update(r["tt"])
+        self.other_tt += r["other_tt"]
+        for k, v in r["raw_rules"].items():
+            self.raw_rules[k] += v
+        self.permissive |= r["permissive"]
+        self.expand.update(r["expand"])
+        self.typebounds |= r["typebounds"]
 
-PERM_MACROS =[
-    PermMacro("create_dir_perms", {"create", "search"}, {"read", "write", "create", "getattr", "setattr", "lock", "rename", "open", "add_name", "remove_name", "reparent", "search", "rmdir"} | OPT_PERMS),
-    PermMacro("rw_dir_perms", {"read", "write", "search"}, {"read", "write", "getattr", "lock", "open", "add_name", "remove_name", "search"} | OPT_PERMS),
-    PermMacro("r_dir_perms", {"read", "search"}, {"read", "getattr", "lock", "open", "search"} | OPT_PERMS),
-    PermMacro("create_file_perms", {"create", "write", "open"}, {"read", "write", "create", "getattr", "setattr", "lock", "append", "unlink", "rename", "open"} | OPT_PERMS),
-    PermMacro("rx_file_perms", {"read", "execute"}, {"read", "getattr", "lock", "open", "execute", "execute_no_trans"} | OPT_PERMS),
-    PermMacro("rw_file_perms", {"read", "write", "open"}, {"read", "write", "getattr", "lock", "append", "open"} | OPT_PERMS),
-    PermMacro("r_file_perms", {"read", "getattr"}, {"read", "getattr", "lock", "open"} | OPT_PERMS),
-    PermMacro("x_file_perms", {"execute"}, {"getattr", "execute", "execute_no_trans"} | OPT_PERMS),
-    PermMacro("w_file_perms", {"write", "append"}, {"write", "append", "open", "lock"} | OPT_PERMS),
-    PermMacro("create_socket_perms", {"create", "bind", "connect"}, {"read", "write", "create", "getattr", "setattr", "lock", "append", "bind", "connect", "getopt", "setopt", "shutdown"} | OPT_PERMS),
-    PermMacro("rw_socket_perms", {"read", "write", "bind"}, {"read", "write", "getattr", "setattr", "lock", "append", "bind", "connect", "getopt", "setopt", "shutdown"} | OPT_PERMS),
-]
+    def finish(self):
+        self.prop_types = {t for t, a in self.type_attrs.items() if "property_type" in a} | \
+                          {t for t in self.types if t.endswith("_prop")}
 
-def compress_perms(perms_str: str) -> str:
-    if not perms_str.startswith("{"): return perms_str
-    
-    perms = set(perms_str.replace("{", "").replace("}", "").split())
-    used_macros =[]
-    
-    for m in PERM_MACROS:
-        if m.triggers.issubset(perms):
-            perms -= m.swallows
-            used_macros.append(m.name)
-            
-    if used_macros:
-        res = sorted(used_macros) + sorted(list(perms))
-        if len(res) > 1: return f"{{ {' '.join(res)} }}"
-        return res[0]
-        
-    return perms_str
+    def atoms(self):
+        """Atomic view of the ORIGINAL policy (for verification)."""
+        out = set()
+        for (act, s, t, c), perms in self.av.items():
+            for p in perms:
+                out.add((act, s, t, c, p))
+        for (s, t, c, n), new in self.tt.items():
+            out.add(("type_transition", s, t, c, f"{new}|{n or ''}"))
+        return out
 
-# ---------------------------------------------------------------------------
-# Modern Macro Condenser
-# ---------------------------------------------------------------------------
 
-class MacroCondenser:
-    def __init__(self, domain, type_decls, attributes, rules):
-        self.domain = domain
-        self.type_decls = list(dict.fromkeys(type_decls))
-        self.attributes = list(dict.fromkeys(attributes))
-        self.rules      = list(dict.fromkeys(rules))
-        
-        self.macros = set()
-        self.clean_rules =[]
-        self.clean_attrs =[]
-        self.has_set_prop = False
+def _prop_macro(attrs: set, avail: set):
+    hits = []
+    for o in PROP_OWNERS:
+        for sc in PROP_SCOPES:
+            m = f"{o}_{sc}_prop"
+            need = {"property_type", f"{o}_property_type", f"{o}_{sc}_property_type"}
+            if m in avail and need <= attrs:
+                hits.append((m, need))
+    return hits[0] if len(hits) == 1 else None
 
-    def condense(self) -> tuple:
-        drop_regexes =[]
-
-        compressed_rules =[]
-        for r in self.rules:
-            m = re.match(r'^(allow|dontaudit|neverallow)\s+(\S+)\s+(\S+):(\S+)\s+(.+);$', r)
-            if m:
-                action, src, tgt, cls, perms_str = m.groups()
-                comp_perms = compress_perms(perms_str)
-                compressed_rules.append(f"{action} {src} {tgt}:{cls} {comp_perms};")
-            else:
-                compressed_rules.append(r)
-
-        for r in compressed_rules:
-            m = re.match(r'allow\s+(\S+)\s+(\S+)_exec:file\s+(.*entrypoint.*);', r)
-            if m and m.group(1) == self.domain and m.group(2) == self.domain:
-                self.macros.add(f"init_daemon_domain({self.domain})")
-                drop_regexes.append(rf'^allow {self.domain} {self.domain}_exec:file .*$')
-                continue
-                
-            m = re.match(r'allow\s+(\S+)\s+(\S+_prop):file\s+(r_file_perms|\{.*?read.*?\});', r)
-            if m:
-                self.macros.add(f"get_prop({m.group(1)}, {m.group(2)})")
-                drop_regexes.append(rf'^allow {m.group(1)} {m.group(2)}:dir.*$')
-                continue
-
-            m = re.match(r'allow\s+(\S+)\s+(\S+_prop):property_service\s+set;', r)
-            if m:
-                self.macros.add(f"set_prop({m.group(1)}, {m.group(2)})")
-                self.has_set_prop = True
-                continue
-
-            m = re.match(r'allow\s+(\S+)\s+(hw|vnd|)servicemanager:binder\s+(.*call.*);', r)
-            if m:
-                pfx = m.group(2)
-                if pfx == "": self.macros.add(f"binder_use({m.group(1)})")
-                elif pfx == "hw": self.macros.add(f"hwbinder_use({m.group(1)})")
-                elif pfx == "vnd": self.macros.add(f"vndbinder_use({m.group(1)})")
-                drop_regexes.append(rf'^allow {m.group(1)} {pfx}servicemanager:fd use;$')
-                drop_regexes.append(rf'^allow {m.group(1)} {pfx}servicemanager:binder.*transfer.*;$')
-                continue
-
-            m = re.match(r'allow\s+(\S+)\s+(\S+):binder\s+(.*call.*);', r)
-            if m and m.group(2) not in ("servicemanager", "hwservicemanager", "vndservicemanager", "self"):
-                self.macros.add(f"binder_call({m.group(1)}, {m.group(2)})")
-                drop_regexes.append(rf'^allow {m.group(1)} {m.group(2)}:fd use;$')
-                drop_regexes.append(rf'^allow {m.group(1)} {m.group(2)}:binder.*transfer.*;$')
-                continue
-
-            m = re.match(r'allow\s+(\S+)\s+(\S+):service_manager\s+(.*add.*);', r)
-            if m:
-                self.macros.add(f"add_service({m.group(1)}, {m.group(2)})")
-                drop_regexes.append(rf'^allow {m.group(1)} {m.group(2)}:service_manager.*find.*;$')
-                continue
-
-            m = re.match(r'allow\s+(\S+)\s+(\S+):hwservice_manager\s+(.*add.*);', r)
-            if m:
-                self.macros.add(f"add_hwservice({m.group(1)}, {m.group(2)})")
-                drop_regexes.append(rf'^allow {m.group(1)} {m.group(2)}:hwservice_manager.*find.*;$')
-                continue
-
-            m = re.match(r'allow\s+(\S+)\s+sysfs_wake_lock:file\s+(.*write.*|w_file_perms|rw_file_perms);', r)
-            if m:
-                self.macros.add(f"wakelock_use({m.group(1)})")
-                continue
-
-            self.clean_rules.append(r)
-
-        if self.has_set_prop:
-            drop_regexes.append(rf'^allow {self.domain} property_socket:sock_file write;$')
-            drop_regexes.append(rf'^allow {self.domain} init:unix_stream_socket connectto;$')
-            
-        if self.domain in ("servicemanager", "hwservicemanager", "vndservicemanager"):
-            drop_regexes.append(rf'^allow {self.domain} \S+:dir.*search.*$')
-            drop_regexes.append(rf'^allow {self.domain} \S+:file.*(read|map|open|r_file_perms).*$')
-            drop_regexes.append(rf'^allow {self.domain} \S+:process getattr;$')
-            drop_regexes.append(rf'^allow {self.domain} \S+:binder.*(call|transfer).*$')
-            drop_regexes.append(rf'^allow {self.domain} \S+:fd use;$')
-
-        final_rules =[]
-        for r in self.clean_rules:
-            drop = any(re.match(pattern, r) for pattern in drop_regexes)
-            if not drop: final_rules.append(r)
-
-        for attr in self.attributes:
-            m = re.match(r'typeattribute\s+(\S+)\s+(hal_\S+)_client;', attr)
-            if m:
-                self.macros.add(f"hal_client_domain({m.group(1)}, {m.group(2)})")
-                continue
-            m = re.match(r'typeattribute\s+(\S+)\s+(hal_\S+)_server;', attr)
-            if m:
-                self.macros.add(f"hal_server_domain({m.group(1)}, {m.group(2)})")
-                continue
-                
-            if " netdomain;" in attr: self.macros.add(f"net_domain({self.domain})"); continue
-            if " appdomain;" in attr: self.macros.add(f"app_domain({self.domain})"); continue
-            if " bluetoothdomain;" in attr: self.macros.add(f"bluetooth_domain({self.domain})"); continue
-            
-            self.clean_attrs.append(attr)
-
-        is_domain = any(re.match(rf'^typeattribute\s+{re.escape(self.domain)}\s+domain;$', a) for a in self.clean_attrs)
-        
-        if not is_domain and len(self.type_decls) == 1 and self.type_decls[0].startswith("type "):
-            attrs =[]
-            for a in self.clean_attrs:
-                m = re.match(r'^typeattribute\s+\S+\s+(\S+);$', a)
-                if m:
-                    attrs.append(m.group(1))
-            if attrs:
-                decl = self.type_decls[0].strip(';')
-                self.type_decls[0] = f"{decl}, {', '.join(sorted(attrs))};"
-                self.clean_attrs =[]
-
-        return sorted(self.type_decls), sorted(self.clean_attrs), sorted(list(self.macros)) + sorted(final_rules)
 
 # ---------------------------------------------------------------------------
-# I/O Helpers
+# Rendering
 # ---------------------------------------------------------------------------
 
-def _ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+def _cls_str(classes):
+    c = sorted(classes)
+    return c[0] if len(c) == 1 else "{ " + " ".join(c) + " }"
+
+
+def render_name(name, idx, by_src, pm, macros_for, prop_avail, use_perm_macros):
+    decl, rules = [], []
+
+    # ---- declaration ----------------------------------------------------
+    at = set(idx.type_attrs.get(name, ()))
+    extra_attr_lines = []
+    if name in idx.types:
+        pm_hit = _prop_macro(at, prop_avail)
+        if pm_hit:
+            decl.append(f"{pm_hit[0]}({name})")
+            at -= pm_hit[1]
+            extra_attr_lines = [f"typeattribute {name} {a};" for a in sorted(at)]
+        else:
+            decl.append(f"type {name}" + ("".join(f", {a}" for a in sorted(at))) + ";")
+    else:
+        extra_attr_lines = [f"typeattribute {name} {a};" for a in sorted(at)]
+    for al in sorted(idx.aliases.get(name, ())):
+        decl.append(f"typealias {name} alias {al};")
+    if name in idx.permissive:
+        decl.append(f"permissive {name};")
+    for p, c in sorted(idx.typebounds):
+        if c == name:
+            decl.append(f"typebounds {p} {c};")
+    decl += extra_attr_lines
+
+    # ---- rules ----------------------------------------------------------
+    rules += sorted(macros_for.get(name, []))
+
+    grp = defaultdict(set)
+    for (act, s, t, c), perms in by_src.get(name, []):
+        ps = pm.compress(perms, c) if use_perm_macros else \
+            (next(iter(perms)) if len(perms) == 1 else "{ " + " ".join(sorted(perms)) + " }")
+        grp[(act, t, ps)].add(c)
+    avl = []
+    for (act, t, ps), classes in grp.items():
+        avl.append(((ACTION_ORDER.get(act, 9), t, _cls_str(classes), ps),
+                    f"{act} {name} {t}:{_cls_str(classes)} {ps};"))
+    rules += [l for _, l in sorted(avl)]
+
+    xg = defaultdict(set)
+    for (act, s, t, c, xt), xp in idx.avx.items():
+        if s == name:
+            xg[(act, t, c, xt)] |= xp
+    for (act, t, c, xt), xp in sorted(xg.items()):
+        body = next(iter(xp)) if len(xp) == 1 else "{ " + " ".join(sorted(xp)) + " }"
+        rules.append(f"{act} {name} {t}:{c} {xt} {body};")
+
+    for (s, t, c, fname), new in sorted(idx.tt.items(), key=lambda kv: (kv[0][1], kv[0][2], kv[0][3] or "")):
+        if s == name:
+            rules.append(f"type_transition {s} {t}:{c} {new}" + (f" {fname}" if fname else "") + ";")
+    for kind, s, t, c, new in idx.other_tt:
+        if s == name:
+            rules.append(f"{'type_change' if kind == 'typechange' else 'type_member'} {s} {t}:{c} {new};")
+    if name in idx.expand:
+        rules.append(f"expandtypeattribute {name} {idx.expand[name]};")
+    rules += sorted(idx.raw_rules.get(name, []))
+    return {"type_decl": decl, "attributes": [], "rules": rules}
+
+
+def _public_types(data):
+    pub = set()
+    for pdata in data["partitions"].values():
+        for lines in pdata.get("mappings", {}).values():
+            nodes, _ = read_sexps(lines)
+            for st in nodes:
+                if isinstance(st, list) and len(st) == 3 and st[0] == "typeattributeset" \
+                        and isinstance(st[2], list):
+                    for m in st[2]:
+                        if isinstance(m, str):
+                            pub.add(m)
+    return pub
+
+
+def _te_macro_names(path):
+    names = set()
+    paths = [path] if os.path.isfile(path) else \
+        [os.path.join(path, f) for f in ("te_macros", "global_macros") if os.path.isfile(os.path.join(path, f))]
+    for p in paths:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            names |= set(re.findall(r"define\(\s*`(\w+)'", f.read()))
+    return names
+
+
+# ---------------------------------------------------------------------------
+# I/O helpers
+# ---------------------------------------------------------------------------
 
 def _write_lines(filepath: str, lines: list):
-    _ensure_dir(os.path.dirname(filepath))
-    
-    # Prune consecutive blank lines for perfect spacing
-    clean_lines =[]
-    prev_empty = False
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    clean, prev_empty = [], False
     for line in lines:
-        is_empty = (line.strip() == "")
-        if is_empty and prev_empty:
+        e = line.strip() == ""
+        if e and prev_empty:
             continue
-        clean_lines.append(line)
-        prev_empty = is_empty
-        
+        clean.append(line)
+        prev_empty = e
     with open(filepath, "w", encoding="utf-8") as f:
-        for line in clean_lines:
+        for line in clean:
             f.write(line + "\n")
 
-def _write_te_file(filepath: str, group_name: str, tier: str, content_by_domain: dict):
+
+def _write_te_file(filepath, group_name, tier, content_by_domain, partitions):
     cat, subcat, role, vendor = get_taxonomy(group_name)
-    
-    lines =[
-        f"# {'=' * 60}",
-        f"# File: {group_name}.te",
-        f"# Tier: {tier}",
-        f"# Vendor: {vendor}",
-        f"# Category: {cat}",
-        f"# Subcategory: {subcat}",
-        f"# Role: {role}",
-        f"# Generated by sepolicy_extract",
-        f"# {'=' * 60}",
-        ""
-    ]
-    
+    lines = [f"# {'=' * 60}", f"# File: {group_name}.te", f"# Tier: {tier}",
+             f"# Partitions: {', '.join(partitions)}", f"# Vendor: {vendor}",
+             f"# Category: {cat}", f"# Subcategory: {subcat}", f"# Role: {role}",
+             "# Generated by sepolicy_extract", f"# {'=' * 60}", ""]
     multiple = len(content_by_domain) > 1
-    for domain_name in sorted(content_by_domain.keys()):
-        dom = content_by_domain[domain_name]
+    for dn in sorted(content_by_domain):
+        dom = content_by_domain[dn]
         if multiple:
-            lines.append(f"# --- {domain_name} ---")
-            
-        if dom["type_decl"]:  
-            lines += dom["type_decl"]
-            lines.append("")
-        if dom["attributes"]: 
-            lines += dom["attributes"]
-            lines.append("")
-        if dom["rules"]:      
-            lines += dom["rules"]
-            lines.append("")
-            
+            lines.append(f"# --- {dn} ---")
+        if dom["type_decl"]:
+            lines += dom["type_decl"] + [""]
+        if dom["rules"]:
+            lines += dom["rules"] + [""]
         lines.append("")
-
     _write_lines(filepath, lines)
 
-def _write_attributes_file(filepath: str, partition: str, global_attrs: dict):
-    base_attrs =[]
-    hal_attrs = defaultdict(list)
-    core_attrs =[]
-    
-    for attr_name in sorted(global_attrs.keys()):
-        line = global_attrs[attr_name]
-        if attr_name.startswith("base_typeattr_"):
-            base_attrs.append(line)
-        elif "hal_" in attr_name or "_client" in attr_name or "_server" in attr_name:
-            cat, _, _, _ = get_taxonomy(attr_name)
-            hal_attrs[cat].append(line)
+
+def _write_attributes_file(filepath, partition, attr_names):
+    base, hal, core = [], defaultdict(list), []
+    for n in sorted(attr_names):
+        line = f"attribute {n};"
+        if n.startswith("base_typeattr_"):
+            base.append(line)
+        elif "hal_" in n or "_client" in n or "_server" in n:
+            hal[get_taxonomy(n)[0]].append(line)
         else:
-            core_attrs.append(line)
-            
-    lines =[
-        f"# Global attributes for {partition}",
-        f"# Generated by sepolicy_extract",
-        ""
-    ]
-    
-    if core_attrs:
-        lines.append("# [ Core Attributes ]")
-        lines.extend(core_attrs)
-        lines.append("")
-        
-    for cat, attrs in sorted(hal_attrs.items()):
-        if cat == "Uncategorized": cat = "Misc HALs"
-        lines.append(f"# [ HAL Attributes - {cat} ]")
-        lines.extend(attrs)
-        lines.append("")
-        
-    if base_attrs:
-        lines.append("# [ Base Type Attributes ]")
-        lines.extend(base_attrs)
-        lines.append("")
-        
+            core.append(line)
+    lines = [f"# Global attributes for {partition}", "# Generated by sepolicy_extract", ""]
+    if core:
+        lines += ["# [ Core Attributes ]"] + core + [""]
+    for cat, a in sorted(hal.items()):
+        lines += [f"# [ HAL Attributes - {'Misc HALs' if cat == 'Uncategorized' else cat} ]"] + a + [""]
+    if base:
+        lines += ["# [ Base Type Attributes ]"] + base + [""]
     _write_lines(filepath, lines)
 
+
 # ---------------------------------------------------------------------------
-# Main Entry Point
+# Entry point
 # ---------------------------------------------------------------------------
 
-def write_output(parsed: dict, data: dict, out_dir: str):
-    print(f"\n[TE] Analyzing Android API mappings for public/private sorting...")
-    
-    public_types = set()
-    for pdata in data["partitions"].values():
-        for m_lines in pdata.get("mappings", {}).values():
-            for line in m_lines:
-                m = re.match(r'\(typeattributeset\s+\S+\s+\((.+?)\)\)', line)
-                if m:
-                    for t in m.group(1).split():
-                        public_types.add(t)
+def write_output(parsed: dict, data: dict, out_dir: str, options: dict = None) -> dict:
+    options = options or {}
+    use_perm = not options.get("no_perm_macros")
+    use_dom = not options.get("no_domain_macros")
 
-    print(f"[TE] Found {len(public_types)} public types.")
-    print(f"[TE] Writing aligned, sorted, and condensed AOSP-style .te files...")
+    # ---- macro definitions ---------------------------------------------
+    defs = None
+    if options.get("global_macros"):
+        gm = options["global_macros"]
+        gm = os.path.join(gm, "global_macros") if os.path.isdir(gm) else gm
+        with open(gm, encoding="utf-8", errors="replace") as f:
+            defs = parse_global_macros(f.read())
+        print(f"[TE] Loaded {len(defs)} perm macros from {gm}")
+    pm = PermMacros(defs)
 
-    written = 0
-    skipped = 0
+    prop_avail, enabled = set(DEFAULT_PROP_MACROS), None
+    if options.get("te_macros"):
+        known = _te_macro_names(options["te_macros"])
+        prop_avail = {m for m in DEFAULT_PROP_MACROS if m in known}
+        enabled = {c.name for c in mc.ALL_SPECS if c.name in known}
+        print(f"[TE] te_macros: domain macros enabled = {sorted(enabled)}")
 
-    for partition_name, parse_result in parsed.items():
-        domains      = parse_result.get("domains", {})
-        global_attrs = parse_result.get("global_attributes", {})
+    public_types = _public_types(data)
+    print(f"[TE] Found {len(public_types)} public types (from mapping/*.cil).")
 
-        if not domains and not global_attrs:
+    report = {"families": {}, "variant_macros": bool(options.get("variant_macros"))}
+    plan = defaultdict(lambda: defaultdict(dict))   # tier -> group -> {name: content}
+    plan_parts = defaultdict(lambda: defaultdict(set))
+    stats_all = {}
+
+    for fam, members in FAMILIES.items():
+        present = [p for p in members if p in parsed]
+        if not present:
             continue
+        idx = Index()
+        for p in present:
+            idx.merge(p, parsed[p])
+        idx.finish()
+        atoms_before = idx.atoms()
 
-        groups = {}
-        for domain_name in sorted(domains.keys()):
-            dom = domains[domain_name]
-            g_name = get_group_name(domain_name)
-            
-            if g_name not in groups: groups[g_name] = {}
-            
-            t_decls, t_attrs = _transform_property(
-                domain_name,
-                dom.get("type_decl",[]),
-                dom.get("attributes",[])
-            )
-            
-            condenser = MacroCondenser(
-                domain=domain_name,
-                type_decls=t_decls,
-                attributes=t_attrs,
-                rules=dom.get("rules",[])
-            )
-            f_decls, f_attrs, f_rules = condenser.condense()
-            
-            groups[g_name][domain_name] = {
-                "type_decl": f_decls,
-                "attributes": f_attrs,
-                "rules": f_rules
-            }
+        macros_for, stats, specs = {}, {}, {}
+        if use_dom:
+            macros_for, stats, specs = mc.condense(idx, pm, enabled, bool(options.get('variant_macros')))
+        stats_all[fam] = stats
+        print(f"[TE] {fam}: domain macros used: {stats or 'none'}")
+        report["families"][fam] = {"atoms": atoms_before, "specs": specs, "pm": pm,
+                                   "partitions": present}
 
-        for g_name in sorted(groups.keys()):
-            active_domains = {d: c for d, c in groups[g_name].items() if len(c["type_decl"]) + len(c["attributes"]) + len(c["rules"]) > 0}
-            if not active_domains:
-                skipped += 1
-                continue
+        by_src = defaultdict(list)
+        for k, perms in idx.av.items():
+            by_src[k[1]].append((k, perms))
 
-            is_public = any(d in public_types for d in active_domains)
-            
-            if partition_name in["vendor", "odm"]:
+        names = set(idx.types) | set(by_src) | set(idx.type_attrs) | set(macros_for) | \
+            {s for (s, *_r) in idx.tt} | {k[1] for k in idx.avx} | set(idx.aliases) | \
+            set(idx.raw_rules) | idx.permissive | set(idx.expand) | {c for _, c in idx.typebounds} | \
+            {o[1] for o in idx.other_tt}
+
+        groups = defaultdict(dict)
+        for n in sorted(names):
+            c = render_name(n, idx, by_src, pm, macros_for, prop_avail, use_perm)
+            if c["type_decl"] or c["rules"]:
+                groups[get_group_name(n)][n] = c
+
+        for g, doms in groups.items():
+            if fam == "vendor":
                 tier = "vendor"
             else:
-                tier = "public" if is_public else "private"
+                tier = "public" if any(d in public_types for d in doms) else "private"
+            plan[tier][g].update(doms)
+            plan_parts[tier][g] |= set(present)
 
-            tier_dir = os.path.join(out_dir, tier)
-            te_path = os.path.join(tier_dir, f"{g_name}.te")
+        for p in present:
+            attrs = parsed[p]["attributes"]
+            if attrs:
+                tier = "vendor" if fam == "vendor" else "private"
+                _write_attributes_file(os.path.join(out_dir, tier, f"_attributes_{p}.te"), p, attrs)
 
-            _write_te_file(filepath=te_path, group_name=g_name, tier=tier, content_by_domain=active_domains)
+    written = 0
+    for tier, gs in plan.items():
+        for g, doms in gs.items():
+            _write_te_file(os.path.join(out_dir, tier, f"{g}.te"), g, tier, doms,
+                           sorted(plan_parts[tier][g]))
             written += 1
-
-        if global_attrs:
-            tier = "vendor" if partition_name in["vendor", "odm"] else "private"
-            attr_path = os.path.join(out_dir, tier, f"_attributes_{partition_name}.te")
-            _write_attributes_file(filepath=attr_path, partition=partition_name, global_attrs=global_attrs)
-                
-    print(f"\n[DONE] Successfully wrote {written} perfectly formatted files.")
+    print(f"\n[DONE] Wrote {written} .te files (each path written exactly once).")
+    report["stats"] = stats_all
+    return report

@@ -171,6 +171,9 @@ def read_staged(staged: dict) -> dict:
         # --- Read context files ---
         contexts = info.get("contexts", {})
         for fname, fpath in contexts.items():
+            if fname.startswith("precompiled_sepolicy") and not fname.endswith(".sha256"):
+                print(f"  [skip] {fname} (binary)")
+                continue
             raw_lines = _read_lines(fpath)
 
             # Strip #line directives for files that need it
