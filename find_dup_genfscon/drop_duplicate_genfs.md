@@ -1,12 +1,14 @@
-chmod +x drop_duplicate_genfs.py
+chmod +x dedup_contexts.py
 
-# Default: writes genfs_contexts.dedup
-./drop_duplicate_genfs.py genfs_contexts plat/genfs_contexts vendor/genfs_contexts
+# 1) genfs_contexts
+./dedup_contexts.py genfs_contexts \
+    plat/genfs_contexts vendor/genfs_contexts \
+    -o genfs_contexts.dedup --diff
 
-# Explicit output + see what got dropped and why
-./drop_duplicate_genfs.py genfs_contexts plat/genfs_contexts vendor/genfs_contexts \
-    -o genfs_contexts.clean --diff
+# 2) file_contexts (same logic, different parser)
+./dedup_contexts.py file_contexts \
+    plat_file_contexts vendor_file_contexts \
+    -o file_contexts.dedup --diff
 
-# Only remove entries that are 100% identical (fs+path+context all equal)
-./drop_duplicate_genfs.py genfs_contexts plat/genfs_contexts vendor/genfs_contexts \
-    --by-context
+# Force a type if filenames are unconventional:
+./dedup_contexts.py my_fc_primary.txt other1.txt --type file_contexts
